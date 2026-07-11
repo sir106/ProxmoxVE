@@ -11,8 +11,28 @@
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 CONF_FILE="/etc/update-lxcs.conf"
+LOG_FILE="/tmp/update-lxcs.log"
+SCRIPT_FAILED=false
 
-echo -e "\n $(date)"
+echo -e "\n $(date)" > "$LOG_FILE"
+exec > >(tee "$LOG_FILE") 2>&1
+
+# Load Healthchecks.io configuration
+HC_URL=""
+if [[ -f "$CONF_FILE" ]]; then
+  HC_URL=$(grep -oP '^\s*HEALTHCHECKS_URL\s*=\s*\K.+' "$CONF_FILE" 2>/dev/null | tr -d '"' | tr -d "'")
+fi
+
+# Signal-Handling for CTRL+C
+function send_failure() {
+  if [[ -n "$HC_URL" ]]; then
+    curl -fsS --retry 3 --data-binary @"$LOG_FILE" "${HC_URL}/fail" >/dev/null 2>&1
+  fi
+}
+trap send_failure SIGINT SIGTERM
+
+# Start-Signal to healthcheck URL (only when found in config)
+[[ -n "$HC_URL" ]] && curl -fsS --retry 3 "${HC_URL}/start" >/dev/null 2>&1
 
 # Collect excluded containers from arguments
 excluded_containers=("$@")
@@ -65,7 +85,11 @@ for container in $(pct list | awk '{if(NR>1) print $1}'); do
       echo -e "[Info] Starting $container"
       pct start "$container"
       sleep 5
-      update_container "$container" || echo " [Error] Update failed for $container"
+      if ! update_container "$container"; then
+        echo " [Error] Update failed for $container"
+        SCRIPT_FAILED=true
+      fi
+      
       # check if patchmon agent is present in container and run a report if found
       if pct exec "$container" -- [ -e "/usr/local/bin/patchmon-agent" ]; then
         echo -e "${BL}[Info]${GN} patchmon-agent found in ${BL} $container ${CL}, triggering report. \n"
